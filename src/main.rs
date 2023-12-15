@@ -62,8 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })
     .await;
 
-    let packet_info = cfg!(target_family = "unix");
-    if let Err(err) = main_entry(device, MTU, packet_info, args, rx).await {
+    if let Err(err) = main_entry(device, args, rx).await {
         log::trace!("main_entry error {}", err);
     }
 

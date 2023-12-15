@@ -13,18 +13,19 @@ ctrlc2 = { version = "3.5", features = ["tokio", "termination"] }
 digest_auth = "0.3"
 dotenvy = "0.15"
 env_logger = "0.10"
+futures = "0.3"
 httparse = "1.8"
-ipstack = { git = "https://github.com/ssrlive/ipstack.git" }
 log = "0.4"
+lwip = "0.3"
 socks5-impl = { version = "0.5" }
 thiserror = "1.0"
 tokio = { version = "1.34", features = ["full"] }
+tproxy-config = { path = "tproxy-config" }
 trust-dns-proto = "0.23"
 tun = { git = "https://github.com/ssrlive/rust-tun.git", features = ["async"] }
 udp-stream = { version = "0.0", default-features = false }
 unicase = "2.7"
 url = "2.5"
-tproxy-config = { path = "tproxy-config" }
 
 [workspace]
 members = ["tproxy-config"]

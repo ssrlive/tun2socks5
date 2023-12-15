@@ -21,8 +21,8 @@ pub enum Error {
     #[error("TryFromSliceError {0:?}")]
     TryFromSlice(#[from] std::array::TryFromSliceError),
 
-    #[error("IpStackError {0:?}")]
-    IpStack(#[from] ipstack::IpStackError),
+    #[error("Lwip {0:?}")]
+    Lwip(#[from] lwip::Error),
 
     #[error("DnsProtoError {0:?}")]
     DnsProto(#[from] trust_dns_proto::error::ProtoError),

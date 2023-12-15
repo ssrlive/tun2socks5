@@ -4,14 +4,20 @@ use crate::{
     http::HttpManager,
     session_info::{IpProtocol, SessionInfo},
 };
-use ipstack::stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream};
 use proxy_handler::{ConnectionManager, ProxyHandler};
 use socks::SocksProxyManager;
-use std::{collections::VecDeque, net::SocketAddr, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    net::SocketAddr,
+    sync::Arc,
+};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
-    sync::{mpsc::Receiver, Mutex},
+    sync::{
+        mpsc::{self, Receiver, Sender},
+        Mutex,
+    },
 };
 use tproxy_config::is_private_ip;
 use udp_stream::UdpStream;
@@ -34,14 +40,9 @@ const DNS_PORT: u16 = 53;
 static TASK_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 use std::sync::atomic::Ordering::Relaxed;
 
-pub async fn main_entry<D>(device: D, mtu: u16, packet_info: bool, args: Args, mut quit: Receiver<()>) -> crate::Result<()>
-where
-    D: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
+pub async fn main_entry(device: tun::AsyncDevice, args: Args, mut quit: Receiver<()>) -> crate::Result<()> {
     let server_addr = args.proxy.addr;
     let key = args.proxy.credentials.clone();
-    let dns_addr = args.dns_addr;
-    let ipv6_enabled = args.ipv6_enabled;
 
     use socks5_impl::protocol::Version::{V4, V5};
     let mgr = match args.proxy.proxy_type {
@@ -50,68 +51,136 @@ where
         ProxyType::Http => Arc::new(HttpManager::new(server_addr, key)) as Arc<dyn ConnectionManager>,
     };
 
-    let mut ipstack_config = ipstack::IpStackConfig::default();
-    ipstack_config.mtu(mtu);
-    ipstack_config.packet_info(packet_info);
+    use futures::{SinkExt, StreamExt};
 
-    let mut ip_stack = ipstack::IpStack::new(ipstack_config, device);
+    let (stack, mut tcp_listener, udp_socket) = ::lwip::NetStack::new()?;
+    let (mut stack_sink, mut stack_stream) = stack.split();
 
-    loop {
-        let ip_stack_stream = tokio::select! {
-            _ = quit.recv() => {
-                log::info!("");
-                log::info!("Ctrl-C recieved, exiting...");
-                break;
-            }
-            ip_stack_stream = ip_stack.accept() => {
-                ip_stack_stream?
-            }
-        };
-        match ip_stack_stream {
-            IpStackStream::Tcp(tcp) => {
-                log::trace!("Session count {}", TASK_COUNT.fetch_add(1, Relaxed) + 1);
-                let info = SessionInfo::new(tcp.local_addr(), tcp.peer_addr(), IpProtocol::Tcp);
-                let proxy_handler = mgr.new_proxy_handler(info, false).await?;
-                tokio::spawn(async move {
-                    if let Err(err) = handle_tcp_session(tcp, server_addr, proxy_handler).await {
-                        log::error!("{} error \"{}\"", info, err);
-                    }
-                    log::trace!("Session count {}", TASK_COUNT.fetch_sub(1, Relaxed) - 1);
-                });
-            }
-            IpStackStream::Udp(udp) => {
-                log::trace!("Session count {}", TASK_COUNT.fetch_add(1, Relaxed) + 1);
-                let mut info = SessionInfo::new(udp.local_addr(), udp.peer_addr(), IpProtocol::Udp);
-                if info.dst.port() == DNS_PORT {
-                    if is_private_ip(info.dst.ip()) {
-                        info.dst.set_ip(dns_addr);
-                    }
-                    if args.dns == args::ArgDns::OverTcp {
-                        let proxy_handler = mgr.new_proxy_handler(info, false).await?;
-                        tokio::spawn(async move {
-                            if let Err(err) = handle_dns_over_tcp_session(udp, server_addr, proxy_handler, ipv6_enabled).await {
-                                log::error!("{} error \"{}\"", info, err);
-                            }
-                            log::trace!("Session count {}", TASK_COUNT.fetch_sub(1, Relaxed) - 1);
-                        });
-                        continue;
-                    }
-                }
-                let proxy_handler = mgr.new_proxy_handler(info, true).await?;
-                tokio::spawn(async move {
-                    if let Err(err) = handle_udp_associate_session(udp, server_addr, proxy_handler, ipv6_enabled).await {
-                        log::error!("{} error \"{}\"", info, err);
-                    }
-                    log::trace!("Session count {}", TASK_COUNT.fetch_sub(1, Relaxed) - 1);
-                });
+    // tun device is assumed implementing `Stream` and `Sink`
+    let framed = device.into_framed();
+    let (mut tun_sink, mut tun_stream) = framed.split();
+
+    // Reads packet from stack and sends to TUN.
+    tokio::spawn(async move {
+        while let Some(pkt) = stack_stream.next().await {
+            if let Ok(pkt) = pkt {
+                tun_sink.send(tun::TunPacket::new(pkt)).await.unwrap();
             }
         }
+    });
+
+    // Reads packet from TUN and sends to stack.
+    tokio::spawn(async move {
+        while let Some(pkt) = tun_stream.next().await {
+            if let Ok(pkt) = pkt {
+                stack_sink.send(pkt.into_bytes().into()).await.unwrap();
+            }
+        }
+    });
+
+    // Extracts TCP connections from stack and sends them to the dispatcher.
+    let mgr1: Arc<dyn ConnectionManager> = mgr.clone();
+    tokio::spawn(async move {
+        while let Some((stream, local_addr, remote_addr)) = tcp_listener.next().await {
+            tokio::spawn(handle_inbound_stream(stream, local_addr, remote_addr, mgr1.clone(), server_addr));
+        }
+    });
+
+    // Receive and send UDP packets between netstack and NAT manager. The NAT
+    // manager would maintain UDP sessions and send them to the dispatcher.
+    tokio::spawn(async move {
+        if let Err(err) = handle_inbound_datagram(udp_socket, args, mgr).await {
+            log::error!("UDP error \"{}\"", err);
+        }
+    });
+
+    _ = quit.recv().await;
+    log::info!("");
+    log::info!("Ctrl-C recieved, exiting...");
+
+    Ok(())
+}
+
+async fn handle_inbound_stream(
+    tcp_stack: lwip::TcpStream,
+    local_addr: SocketAddr,
+    remote_addr: SocketAddr,
+    mgr: Arc<dyn ConnectionManager>,
+    server_addr: SocketAddr,
+) -> crate::Result<()> {
+    log::trace!("Session count {}", TASK_COUNT.fetch_add(1, Relaxed) + 1);
+    let info = SessionInfo::new(local_addr, remote_addr, IpProtocol::Tcp);
+    let proxy_handler = mgr.new_proxy_handler(info, false).await?;
+    if let Err(err) = handle_tcp_session(tcp_stack, server_addr, proxy_handler).await {
+        log::error!("{} error \"{}\"", info, err);
+    }
+    log::trace!("Session count {}", TASK_COUNT.fetch_sub(1, Relaxed) - 1);
+    Ok(())
+}
+
+async fn handle_inbound_datagram(udp_socket: Box<lwip::UdpSocket>, args: Args, mgr: Arc<dyn ConnectionManager>) -> crate::Result<()> {
+    let server_addr = args.proxy.addr;
+    let (udp_tx, mut udp_rx) = udp_socket.split();
+    let udp_tx = Arc::new(udp_tx);
+
+    let udp_sessions = Arc::new(Mutex::new(HashMap::<SessionInfo, Sender<Vec<u8>>>::new()));
+    let udp_sessions_clone = udp_sessions.clone();
+
+    let (session_dead_tx, mut session_dead_rx) = mpsc::channel::<SessionInfo>(1024);
+    let session_dead_tx = Arc::new(session_dead_tx);
+    tokio::spawn(async move {
+        while let Some(session) = session_dead_rx.recv().await {
+            udp_sessions_clone.lock().await.remove(&session);
+        }
+    });
+
+    while let Ok((incoming_pkt, src_addr, dst_addr)) = udp_rx.recv_from().await {
+        let mut info = SessionInfo::new(src_addr, dst_addr, IpProtocol::Udp);
+        if info.dst.port() == DNS_PORT && is_private_ip(info.dst.ip()) {
+            info.dst.set_ip(args.dns_addr);
+        }
+
+        let mut udp_sessions = udp_sessions.lock().await;
+        if let Some(session_data_sender) = udp_sessions.get(&info) {
+            session_data_sender.send(incoming_pkt).await.ok();
+            continue;
+        }
+
+        let (session_data_sender, session_data_receiver) = mpsc::channel::<Vec<u8>>(1024);
+        udp_sessions.insert(info, session_data_sender);
+
+        let udp_tx = udp_tx.clone();
+        let session_dead_tx = session_dead_tx.clone();
+        let mgr = mgr.clone();
+        let ipv6 = args.ipv6_enabled;
+        tokio::spawn(async move {
+            log::trace!("Session count {}", TASK_COUNT.fetch_add(1, Relaxed) + 1);
+            let first_pkt = incoming_pkt;
+
+            if info.dst.port() == DNS_PORT && args.dns == args::ArgDns::OverTcp {
+                let proxy_handler = mgr.new_proxy_handler(info, false).await?;
+                if let Err(err) = dns_over_tcp_session(first_pkt, session_data_receiver, udp_tx, server_addr, proxy_handler, ipv6).await {
+                    log::error!("{} error \"{}\"", info, err);
+                }
+            } else {
+                let proxy_handler = mgr.new_proxy_handler(info, true).await?;
+                if let Err(err) = udp_generic_session(first_pkt, session_data_receiver, udp_tx, server_addr, proxy_handler, ipv6).await {
+                    log::error!("{} error \"{}\"", info, err);
+                }
+            }
+
+            if let Err(err) = session_dead_tx.send(info).await {
+                log::error!("{} error \"{}\"", info, err);
+            }
+            log::trace!("Session count {}", TASK_COUNT.fetch_sub(1, Relaxed) - 1);
+            Ok::<(), crate::Error>(())
+        });
     }
     Ok(())
 }
 
 async fn handle_tcp_session(
-    tcp_stack: IpStackTcpStream,
+    tcp_stack: lwip::TcpStream,
     server_addr: SocketAddr,
     proxy_handler: Arc<Mutex<dyn ProxyHandler>>,
 ) -> crate::Result<()> {
@@ -139,8 +208,10 @@ async fn handle_tcp_session(
     Ok(())
 }
 
-async fn handle_udp_associate_session(
-    mut udp_stack: IpStackUdpStream,
+async fn udp_generic_session(
+    first_pkt: Vec<u8>,
+    mut session_data_receiver: Receiver<Vec<u8>>,
+    udp_tx: Arc<lwip::UdpSendHalf>,
     server_addr: SocketAddr,
     proxy_handler: Arc<Mutex<dyn ProxyHandler>>,
     ipv6_enabled: bool,
@@ -155,23 +226,31 @@ async fn handle_udp_associate_session(
 
     let mut udp_server = UdpStream::connect(udp_addr).await?;
 
-    let mut buf1 = [0_u8; 4096];
+    async fn write_to_udp_server(udp_server: &mut UdpStream, data: &[u8], session_info: SessionInfo) -> crate::Result<()> {
+        // Add SOCKS5 UDP header to the incoming data
+        let mut s5_udp_data = Vec::<u8>::new();
+        UdpHeader::new(0, session_info.dst.into()).write_to_stream(&mut s5_udp_data)?;
+        s5_udp_data.extend_from_slice(data);
+
+        udp_server.write_all(&s5_udp_data).await?;
+        Ok(())
+    }
+
+    write_to_udp_server(&mut udp_server, &first_pkt, session_info).await?;
+
+    // Set your desired timeout duration
+    let timeout_duration = std::time::Duration::from_secs(5);
+
     let mut buf2 = [0_u8; 4096];
     loop {
+        let timeout = tokio::time::Instant::now() + timeout_duration;
         tokio::select! {
-            len = udp_stack.read(&mut buf1) => {
-                let len = len?;
-                if len == 0 {
+            buf1 = session_data_receiver.recv() => {
+                let buf1 = buf1.ok_or("")?;
+                if buf1.is_empty() {
                     break;
                 }
-                let buf1 = &buf1[..len];
-
-                // Add SOCKS5 UDP header to the incoming data
-                let mut s5_udp_data = Vec::<u8>::new();
-                UdpHeader::new(0, session_info.dst.into()).write_to_stream(&mut s5_udp_data)?;
-                s5_udp_data.extend_from_slice(buf1);
-
-                udp_server.write_all(&s5_udp_data).await?;
+                write_to_udp_server(&mut udp_server, &buf1, session_info).await?;
             }
             len = udp_server.read(&mut buf2) => {
                 let len = len?;
@@ -194,7 +273,12 @@ async fn handle_udp_associate_session(
                     data.to_vec()
                 };
 
-                udp_stack.write_all(&buf).await?;
+                // udp_tx.send_to(&buf, &session_info.dst, &session_info.src)?;
+                udp_tx.send_to(&buf, &session_info.src, &session_info.dst)?;
+            }
+            _ = tokio::time::sleep_until(timeout) => {
+                log::trace!("{} timeout", session_info);
+                break;
             }
         }
     }
@@ -204,8 +288,10 @@ async fn handle_udp_associate_session(
     Ok(())
 }
 
-async fn handle_dns_over_tcp_session(
-    mut udp_stack: IpStackUdpStream,
+async fn dns_over_tcp_session(
+    first_pkt: Vec<u8>,
+    mut session_data_receiver: Receiver<Vec<u8>>,
+    udp_tx: Arc<lwip::UdpSendHalf>,
     server_addr: SocketAddr,
     proxy_handler: Arc<Mutex<dyn ProxyHandler>>,
     ipv6_enabled: bool,
@@ -217,26 +303,31 @@ async fn handle_dns_over_tcp_session(
 
     let _ = handle_proxy_session(&mut server, proxy_handler).await?;
 
-    let mut buf1 = [0_u8; 4096];
+    async fn write_to_server(server: &mut TcpStream, data: &[u8]) -> crate::Result<()> {
+        _ = dns::parse_data_to_dns_message(data, false)?;
+
+        // Insert the DNS message length in front of the payload
+        let len = u16::try_from(data.len())?;
+        let mut buf = Vec::with_capacity(std::mem::size_of::<u16>() + usize::from(len));
+        buf.extend_from_slice(&len.to_be_bytes());
+        buf.extend_from_slice(data);
+
+        server.write_all(&buf).await?;
+        Ok(())
+    }
+
+    write_to_server(&mut server, &first_pkt).await?;
+
     let mut buf2 = [0_u8; 4096];
     loop {
         tokio::select! {
-            len = udp_stack.read(&mut buf1) => {
-                let len = len?;
-                if len == 0 {
+            buf1 = session_data_receiver.recv() => {
+                let buf1 = buf1.ok_or("")?;
+                if buf1.is_empty() {
                     break;
                 }
-                let buf1 = &buf1[..len];
 
-                _ = dns::parse_data_to_dns_message(buf1, false)?;
-
-                // Insert the DNS message length in front of the payload
-                let len = u16::try_from(buf1.len())?;
-                let mut buf = Vec::with_capacity(std::mem::size_of::<u16>() + usize::from(len));
-                buf.extend_from_slice(&len.to_be_bytes());
-                buf.extend_from_slice(buf1);
-
-                server.write_all(&buf).await?;
+                write_to_server(&mut server, &buf1).await?;
             }
             len = server.read(&mut buf2) => {
                 let len = len?;
@@ -276,7 +367,8 @@ async fn handle_dns_over_tcp_session(
                 }
 
                 while let Some(packet) = to_send.pop_front() {
-                    udp_stack.write_all(&packet).await?;
+                    // udp_tx.send_to(&packet, &session_info.dst, &session_info.src)?;
+                    udp_tx.send_to(&packet, &session_info.src, &session_info.dst)?;
                 }
             }
         }
