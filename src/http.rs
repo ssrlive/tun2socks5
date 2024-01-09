@@ -50,6 +50,7 @@ pub struct HttpConnection {
     before: bool,
     credentials: Option<UserKey>,
     info: SessionInfo,
+    domain_name: Option<String>,
 }
 
 static PROXY_AUTHENTICATE: &str = "Proxy-Authenticate";
@@ -59,7 +60,12 @@ static TRANSFER_ENCODING: &str = "Transfer-Encoding";
 static CONTENT_LENGTH: &str = "Content-Length";
 
 impl HttpConnection {
-    async fn new(info: SessionInfo, credentials: Option<UserKey>, digest_state: Arc<Mutex<Option<DigestState>>>) -> Result<Self> {
+    async fn new(
+        info: SessionInfo,
+        domain_name: Option<String>,
+        credentials: Option<UserKey>,
+        digest_state: Arc<Mutex<Option<DigestState>>>,
+    ) -> Result<Self> {
         let mut res = Self {
             state: HttpState::ExpectResponseHeaders,
             client_inbuf: VecDeque::default(),
@@ -73,6 +79,7 @@ impl HttpConnection {
             before: false,
             credentials,
             info,
+            domain_name,
         };
 
         res.send_tunnel_request().await?;
@@ -80,10 +87,16 @@ impl HttpConnection {
     }
 
     async fn send_tunnel_request(&mut self) -> Result<(), Error> {
+        let host = if let Some(domain_name) = &self.domain_name {
+            format!("{}:{}", domain_name, self.info.dst.port())
+        } else {
+            self.info.dst.to_string()
+        };
+
         self.server_outbuf.extend(b"CONNECT ");
-        self.server_outbuf.extend(self.info.dst.to_string().as_bytes());
+        self.server_outbuf.extend(host.as_bytes());
         self.server_outbuf.extend(b" HTTP/1.1\r\nHost: ");
-        self.server_outbuf.extend(self.info.dst.to_string().as_bytes());
+        self.server_outbuf.extend(host.as_bytes());
         self.server_outbuf.extend(b"\r\n");
 
         let scheme = if self.digest_state.lock().await.is_none() {
@@ -104,7 +117,11 @@ impl HttpConnection {
 
         match scheme {
             AuthenticationScheme::Digest => {
-                let uri = self.info.dst.to_string();
+                let uri = if let Some(domain_name) = &self.domain_name {
+                    format!("{}:{}", domain_name, self.info.dst.port())
+                } else {
+                    self.info.dst.to_string()
+                };
 
                 let context = digest_auth::AuthContext::new_with_method(
                     &credentials.username,
@@ -313,6 +330,10 @@ impl ProxyHandler for HttpConnection {
         self.info
     }
 
+    fn get_domain_name(&self) -> Option<String> {
+        self.domain_name.clone()
+    }
+
     async fn push_data(&mut self, event: IncomingDataEvent<'_>) -> std::io::Result<()> {
         let direction = event.direction;
         let buffer = event.buffer;
@@ -378,12 +399,17 @@ pub(crate) struct HttpManager {
 
 #[async_trait::async_trait]
 impl ProxyHandlerManager for HttpManager {
-    async fn new_proxy_handler(&self, info: SessionInfo, _udp_associate: bool) -> std::io::Result<Arc<Mutex<dyn ProxyHandler>>> {
+    async fn new_proxy_handler(
+        &self,
+        info: SessionInfo,
+        domain_name: Option<String>,
+        _udp_associate: bool,
+    ) -> std::io::Result<Arc<Mutex<dyn ProxyHandler>>> {
         if info.protocol != IpProtocol::Tcp {
             return Err(Error::from("Invalid protocol").into());
         }
         Ok(Arc::new(Mutex::new(
-            HttpConnection::new(info, self.credentials.clone(), self.digest_state.clone()).await?,
+            HttpConnection::new(info, domain_name, self.credentials.clone(), self.digest_state.clone()).await?,
         )))
     }
 
